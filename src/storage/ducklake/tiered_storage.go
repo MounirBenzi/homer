@@ -134,6 +134,14 @@ func (tsm *TieredStorageManager) Start() error {
 		return fmt.Errorf("failed to load sqlite extension: %w", err)
 	}
 
+	// Load the AWS extension so S3 secrets can use PROVIDER credential_chain
+	// (resolves EKS Pod Identity / instance-profile / env credentials via the
+	// AWS SDK). Best-effort: static-key or local-only setups do not need it,
+	// so a load failure must not block startup.
+	if _, err := db.Exec("INSTALL aws; LOAD aws;"); err != nil {
+		logger.Warn("TieredStorageManager: failed to load aws extension (credential_chain unavailable)", "error", err)
+	}
+
 	// Attach each volume as a separate DuckLake
 	for _, vol := range tsm.volumes {
 		if err := tsm.attachVolume(vol); err != nil {
@@ -173,9 +181,23 @@ func (tsm *TieredStorageManager) attachVolume(vol *Volume) error {
 			region = "us-east-1"
 		}
 
-		// Create secret with S3 credentials
+		// Create secret. When no static access key is configured and the
+		// volume targets native AWS S3 (no custom endpoint), use the AWS
+		// credential chain so EKS Pod Identity / instance-profile credentials
+		// are picked up instead of signing requests with empty keys (which
+		// returns HTTP 403). Static keys and custom endpoints (MinIO / R2)
+		// keep the explicit-credential path.
 		var createSecret string
-		if endpoint != "" {
+		switch {
+		case strings.TrimSpace(vol.S3AccessKey) == "" && endpoint == "":
+			createSecret = fmt.Sprintf(`
+				CREATE SECRET %s (
+					TYPE S3,
+					PROVIDER credential_chain,
+					REGION '%s'
+				);
+			`, secretName, region)
+		case endpoint != "":
 			createSecret = fmt.Sprintf(`
 				CREATE SECRET %s (
 					TYPE S3,
@@ -187,7 +209,7 @@ func (tsm *TieredStorageManager) attachVolume(vol *Volume) error {
 					USE_SSL %t
 				);
 			`, secretName, vol.S3AccessKey, vol.S3SecretKey, region, endpoint, vol.S3UseSSL)
-		} else {
+		default:
 			createSecret = fmt.Sprintf(`
 				CREATE SECRET %s (
 					TYPE S3,
